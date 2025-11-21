@@ -20,6 +20,55 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import kuromoji from 'kuromoji';
+import deepl from 'deepl-node';
+
+const { Translator: DeepLTranslator } = deepl;
+
+const POS_MAP = {
+  名詞: 'noun',
+  動詞: 'verb',
+  形容詞: 'adjective',
+  副詞: 'adverb',
+  助詞: 'particle',
+  助動詞: 'auxiliary-verb',
+  記号: 'symbol',
+  連体詞: 'prenoun-adjectival',
+  感動詞: 'interjection',
+  接続詞: 'conjunction',
+  接頭詞: 'prefix',
+  その他: 'other',
+  フィラー: 'filler',
+  // details
+  一般: 'general',
+  固有名詞: 'proper-noun',
+  サ変接続: 'suru-verb',
+  自立: 'independent',
+  非自立: 'non-independent',
+  形容動詞語幹: 'na-adj-stem',
+  数: 'number',
+  助数詞: 'counter',
+  係助詞: 'binding-particle',
+  格助詞: 'case-particle',
+  副助詞: 'adverbial-particle',
+  並立助詞: 'parallel-particle',
+  終助詞: 'sentence-ending-particle',
+  連体化: 'attributive',
+  接続助詞: 'conjunctive-particle',
+  感動詞語幹: 'interjection-stem',
+  括弧開: 'open-bracket',
+  括弧閉: 'close-bracket',
+  句点: 'period',
+  読点: 'comma',
+  空白: 'whitespace',
+  一般: 'general',
+  記号一般: 'symbol-general',
+  代名詞: 'pronoun',
+  副詞可能: 'adverbial',
+  連語: 'expression',
+  語幹: 'stem',
+  テ形: 'te-form',
+  タ形: 'ta-form',
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -36,9 +85,18 @@ try {
   const tokenizer = await buildTokenizer();
   const dictionary = loadDictionary(options.dictPath);
   const translations = loadTranslationHints(options.translationPath);
+  const translator = options.autoTranslate ? createDeepLTranslator({
+    formality: options.deeplFormality,
+    glossaryId: options.deeplGlossaryId,
+  }) : null;
 
   const rawCards = JSON.parse(readFileSync(options.inputPath, 'utf8'));
-  const enrichedCards = rawCards.map((card) => enrichCard(card, tokenizer, dictionary, translations));
+  const enrichedCards = [];
+  for (const card of rawCards) {
+    // eslint-disable-next-line no-await-in-loop
+    const enriched = await enrichCard(card, tokenizer, dictionary, translations, translator);
+    enrichedCards.push(enriched);
+  }
 
   writeFileSync(options.outputJsonPath, JSON.stringify(enrichedCards, null, 2), 'utf8');
   console.log(`Enriched JSON written to ${options.outputJsonPath}`);
@@ -46,6 +104,10 @@ try {
   if (options.writeTsv) {
     writeFileSync(options.tsvPath, cardsToTsv(enrichedCards), 'utf8');
     console.log(`TSV output written to ${options.tsvPath}`);
+  }
+
+  if (options.translationSavePath && translations.addedEntries.length) {
+    persistTranslations(translations, options.translationSavePath);
   }
 } catch (error) {
   console.error(error.message || error);
@@ -55,16 +117,23 @@ try {
 /**
  * @param {ReturnType<kuromoji.Builder["build"]>} tokenizer
  */
-function enrichCard(card, tokenizer, dictionary, translations) {
+async function enrichCard(card, tokenizer, dictionary, translations, translator) {
   const tokens = tokenizer.tokenize(card.sentence || '');
   const breakdown = tokens
     .map((token) => normalizeToken(token, dictionary))
     .filter((token) => token.surface.trim().length);
 
-  const translation =
+  let translation =
     pickTranslation(card, translations) ??
     (card.translation && card.translation.trim().length ? card.translation : null) ??
     buildLiteralTranslation(breakdown);
+
+  if (!translation && translator) {
+    translation = await translator(card);
+    if (translation) {
+      registerGeneratedTranslation(translations, card, translation);
+    }
+  }
 
   return {
     ...card,
@@ -88,8 +157,20 @@ function normalizeToken(token, dictionary) {
 
 function buildPosLabel(token) {
   return [token.pos, token.pos_detail_1, token.pos_detail_2, token.pos_detail_3]
-    .filter((part) => part && part !== '*')
+    .map((part) => translatePosPart(part))
+    .filter(Boolean)
     .join('-');
+}
+
+function translatePosPart(part) {
+  if (!part || part === '*') return null;
+  return part
+    .split('／')
+    .map((segment) => {
+      const trimmed = segment.trim();
+      return POS_MAP[trimmed] ?? trimmed;
+    })
+    .join('/');
 }
 
 function buildLiteralTranslation(tokens) {
@@ -104,8 +185,8 @@ function pickTranslation(card, translations) {
     return translations.byId.get(String(card.id));
   }
 
-  if (card.subtitleId && translations.byId.has(String(card.subtitleId))) {
-    return translations.byId.get(String(card.subtitleId));
+  if (card.subtitleId != null && translations.bySubtitleId.has(String(card.subtitleId))) {
+    return translations.bySubtitleId.get(String(card.subtitleId));
   }
 
   const normalizedSentence = (card.sentence || '').trim();
@@ -142,27 +223,35 @@ function loadDictionary(dictPath) {
 }
 
 function loadTranslationHints(path) {
+  const byId = new Map();
+  const bySubtitleId = new Map();
+  const bySentence = new Map();
+  const initialEntries = [];
+
   if (!path) {
-    return { byId: new Map(), bySentence: new Map() };
+    return { byId, bySubtitleId, bySentence, addedEntries: [], initialEntries, sourcePath: null };
   }
 
   if (!existsSync(path)) {
     console.warn(`Translation hint file not found at ${path}. Skipping translations.`);
-    return { byId: new Map(), bySentence: new Map() };
+    return { byId, bySubtitleId, bySentence, addedEntries: [], initialEntries, sourcePath: path };
   }
 
   const raw = JSON.parse(readFileSync(path, 'utf8'));
-  const byId = new Map();
-  const bySentence = new Map();
 
-  const registerEntry = (entry) => {
-    if (!entry) return;
-    if (entry.id != null && entry.translation) {
-      byId.set(String(entry.id), entry.translation);
+  const registerEntry = (entryLike) => {
+    const safeEntry = sanitizeTranslationEntry(entryLike);
+    if (!safeEntry) return;
+    if (safeEntry.id != null) {
+      byId.set(String(safeEntry.id), safeEntry.translation);
     }
-    if (entry.sentence && entry.translation) {
-      bySentence.set(entry.sentence.trim(), entry.translation);
+    if (safeEntry.subtitleId != null) {
+      bySubtitleId.set(String(safeEntry.subtitleId), safeEntry.translation);
     }
+    if (safeEntry.sentence) {
+      bySentence.set(safeEntry.sentence, safeEntry.translation);
+    }
+    initialEntries.push(safeEntry);
   };
 
   if (Array.isArray(raw)) {
@@ -170,14 +259,14 @@ function loadTranslationHints(path) {
   } else if (typeof raw === 'object' && raw !== null) {
     Object.entries(raw).forEach(([key, value]) => {
       if (typeof value === 'string') {
-        byId.set(key, value);
+        registerEntry({ id: key, translation: value });
       } else if (value && typeof value === 'object') {
         registerEntry({ id: key, ...value });
       }
     });
   }
 
-  return { byId, bySentence };
+  return { byId, bySubtitleId, bySentence, addedEntries: [], initialEntries, sourcePath: path };
 }
 
 function katakanaToHiragana(text) {
@@ -191,9 +280,13 @@ function parseOptions(cliArgs) {
     inputPath: null,
     dictPath: resolveDefaultDict(),
     translationPath: null,
+    translationSavePath: null,
     outputJsonPath: null,
     tsvPath: null,
     writeTsv: true,
+    autoTranslate: false,
+    deeplFormality: 'default',
+    deeplGlossaryId: null,
   };
 
   opts.inputPath = resolve(cliArgs[0]);
@@ -207,6 +300,9 @@ function parseOptions(cliArgs) {
       case '--translations':
         opts.translationPath = ensureNext(cliArgs, ++i, '--translations');
         break;
+      case '--translations-out':
+        opts.translationSavePath = ensureNext(cliArgs, ++i, '--translations-out');
+        break;
       case '--out':
         opts.outputJsonPath = ensureNext(cliArgs, ++i, '--out');
         break;
@@ -215,6 +311,16 @@ function parseOptions(cliArgs) {
         break;
       case '--no-tsv':
         opts.writeTsv = false;
+        break;
+      case '--auto-translate':
+      case '--deepl-translate':
+        opts.autoTranslate = true;
+        break;
+      case '--deepl-formality':
+        opts.deeplFormality = ensureNext(cliArgs, ++i, '--deepl-formality');
+        break;
+      case '--deepl-glossary':
+        opts.deeplGlossaryId = ensureNext(cliArgs, ++i, '--deepl-glossary');
         break;
       default:
         throw new Error(`Unknown option "${token}". Use --help for usage.`);
@@ -228,6 +334,10 @@ function parseOptions(cliArgs) {
   if (opts.writeTsv) {
     const guessedTsv = replaceExt(opts.outputJsonPath, '.tsv');
     opts.tsvPath = resolve(opts.tsvPath ?? guessedTsv);
+  }
+
+  if (!opts.translationSavePath && opts.translationPath) {
+    opts.translationSavePath = opts.translationPath;
   }
 
   return opts;
@@ -263,11 +373,143 @@ function printUsage() {
 
 Options:
   --dict <path>          Custom dictionary JSON
-  --translations <path>  JSON with translations keyed by id or sentence
+  --translations <path>  JSON with translations keyed by id/subtitleId/sentence
+  --translations-out <path>
+                         Write updated translation cache (defaults to --translations path)
   --out <path>           Destination for enriched JSON (defaults to input)
   --tsv <path>           Destination for TSV (defaults to alongside JSON)
   --no-tsv               Skip writing the TSV output
+  --auto-translate       Use DeepL API to fill missing translations
+  --deepl-translate      Alias for --auto-translate
+  --deepl-formality <v>  DeepL formality (default, more, less, prefer_more, prefer_less)
+  --deepl-glossary <id>  DeepL glossary ID to apply
   -h, --help             Show this help text
 `);
+}
+
+function sanitizeTranslationEntry(entry) {
+  if (!entry || typeof entry.translation !== 'string') return null;
+  const translation = entry.translation.trim();
+  if (!translation.length) return null;
+
+  const sentence =
+    typeof entry.sentence === 'string' && entry.sentence.trim().length
+      ? entry.sentence.trim()
+      : null;
+
+  const normalizedId =
+    entry.id === null || entry.id === undefined || entry.id === ''
+      ? null
+      : normalizeNumeric(entry.id);
+
+  const normalizedSubtitleId =
+    entry.subtitleId === null || entry.subtitleId === undefined || entry.subtitleId === ''
+      ? null
+      : normalizeNumeric(entry.subtitleId);
+
+  return {
+    id: normalizedId,
+    subtitleId: normalizedSubtitleId,
+    sentence,
+    translation,
+  };
+}
+
+function normalizeNumeric(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const num = Number.parseInt(value, 10);
+  return Number.isNaN(num) ? value : num;
+}
+
+function registerGeneratedTranslation(translations, card, translation) {
+  const normalizedSentence = (card.sentence || '').trim() || null;
+
+  if (card.id != null) {
+    translations.byId.set(String(card.id), translation);
+  }
+  if (card.subtitleId != null) {
+    translations.bySubtitleId.set(String(card.subtitleId), translation);
+  }
+  if (normalizedSentence) {
+    translations.bySentence.set(normalizedSentence, translation);
+  }
+
+  translations.addedEntries.push(
+    sanitizeTranslationEntry({
+      id: card.id ?? null,
+      subtitleId: card.subtitleId ?? null,
+      sentence: normalizedSentence,
+      translation,
+    }),
+  );
+}
+
+function persistTranslations(translations, outputPath) {
+  const existing = translations.initialEntries ?? [];
+  const additions = translations.addedEntries ?? [];
+  const merged = mergeTranslationEntries(existing, additions);
+  writeFileSync(outputPath, JSON.stringify(merged, null, 2), 'utf8');
+  console.log(
+    `Translation cache updated at ${outputPath} (+${additions.length} new entries).`,
+  );
+}
+
+function mergeTranslationEntries(existing, additions) {
+  const map = new Map();
+  let anonCounter = 0;
+
+  const put = (entry) => {
+    if (!entry) return;
+    const safe = sanitizeTranslationEntry(entry);
+    if (!safe) return;
+    const key =
+      safe.subtitleId != null
+        ? `subtitleId:${safe.subtitleId}`
+        : safe.id != null
+          ? `id:${safe.id}`
+          : safe.sentence
+            ? `sentence:${safe.sentence}`
+            : `anon:${anonCounter++}`;
+    map.set(key, safe);
+  };
+
+  existing.forEach(put);
+  additions.forEach(put);
+
+  return Array.from(map.values());
+}
+
+function createDeepLTranslator(options = {}) {
+  const authKey = process.env.DEEPL_API_KEY;
+  if (!authKey) {
+    throw new Error('DEEPL_API_KEY environment variable is required for --deepl-translate.');
+  }
+
+  const translator = new DeepLTranslator(authKey);
+  const formality = options.formality ?? 'default';
+  const glossaryId = options.glossaryId ?? null;
+
+  return async (card) => {
+    const sentence = (card.sentence || '').trim();
+    if (!sentence.length) return null;
+    try {
+      const response = await translator.translateText(sentence, 'en-US', {
+        sourceLang: 'ja',
+        formality: formality === 'default' ? undefined : formality,
+        glossaryId: glossaryId || undefined,
+      });
+      if (Array.isArray(response)) {
+        return response[0]?.text?.trim() ?? null;
+      }
+      return response?.text?.trim() ?? null;
+    } catch (error) {
+      console.warn(
+        `DeepL translation failed for subtitle ${card.subtitleId ?? card.id}: ${
+          error.message || error
+        }`,
+      );
+      return null;
+    }
+  };
 }
 
