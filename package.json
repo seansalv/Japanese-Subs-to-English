@@ -11,6 +11,7 @@
   "license": "ISC",
   "dependencies": {
     "deepl-node": "^1.22.0",
+    "dotenv": "^17.2.3",
     "kuromoji": "^0.1.2"
   }
 }

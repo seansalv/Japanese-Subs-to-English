@@ -16,6 +16,7 @@
  *   --no-tsv               Skip writing the TSV file
  *   -h, --help             Show usage help
  */
+import 'dotenv/config';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,7 +95,16 @@ try {
   const enrichedCards = [];
   for (const card of rawCards) {
     // eslint-disable-next-line no-await-in-loop
-    const enriched = await enrichCard(card, tokenizer, dictionary, translations, translator);
+    const enriched = await enrichCard(
+      card,
+      tokenizer,
+      dictionary,
+      translations,
+      translator,
+      {
+        autoTranslateReplace: options.autoTranslateReplace,
+      },
+    );
     enrichedCards.push(enriched);
   }
 
@@ -117,20 +127,40 @@ try {
 /**
  * @param {ReturnType<kuromoji.Builder["build"]>} tokenizer
  */
-async function enrichCard(card, tokenizer, dictionary, translations, translator) {
+async function enrichCard(card, tokenizer, dictionary, translations, translator, options = {}) {
   const tokens = tokenizer.tokenize(card.sentence || '');
   const breakdown = tokens
     .map((token) => normalizeToken(token, dictionary))
     .filter((token) => token.surface.trim().length);
 
-  let translation =
-    pickTranslation(card, translations) ??
-    (card.translation && card.translation.trim().length ? card.translation : null) ??
-    buildLiteralTranslation(breakdown);
+  const translatorEnabled = Boolean(translator);
+  const cardTranslation = (card.translation || '').trim();
 
-  if (!translation && translator) {
-    translation = await translator(card);
-    if (translation) {
+  let translationSource = null;
+  let translation = pickTranslation(card, translations);
+  if (translation) {
+    translationSource = 'hint';
+  }
+
+  if (!translation && cardTranslation.length && (!translatorEnabled || !options.autoTranslateReplace)) {
+    translation = cardTranslation;
+    translationSource = 'card';
+  }
+
+  if (!translation) {
+    translation = buildLiteralTranslation(breakdown);
+    translationSource = 'literal';
+  }
+
+  const shouldAutoTranslate =
+    translatorEnabled &&
+    (!translation || (options.autoTranslateReplace && translationSource !== 'hint'));
+
+  if (shouldAutoTranslate) {
+    const generated = await translator(card);
+    if (generated) {
+      translation = generated;
+      translationSource = 'deepl';
       registerGeneratedTranslation(translations, card, translation);
     }
   }
@@ -285,6 +315,7 @@ function parseOptions(cliArgs) {
     tsvPath: null,
     writeTsv: true,
     autoTranslate: false,
+    autoTranslateReplace: true,
     deeplFormality: 'default',
     deeplGlossaryId: null,
   };
@@ -315,6 +346,9 @@ function parseOptions(cliArgs) {
       case '--auto-translate':
       case '--deepl-translate':
         opts.autoTranslate = true;
+        break;
+      case '--auto-translate-keep':
+        opts.autoTranslateReplace = false;
         break;
       case '--deepl-formality':
         opts.deeplFormality = ensureNext(cliArgs, ++i, '--deepl-formality');
@@ -381,6 +415,7 @@ Options:
   --no-tsv               Skip writing the TSV output
   --auto-translate       Use DeepL API to fill missing translations
   --deepl-translate      Alias for --auto-translate
+  --auto-translate-keep  Keep existing card translations (don’t overwrite literals)
   --deepl-formality <v>  DeepL formality (default, more, less, prefer_more, prefer_less)
   --deepl-glossary <id>  DeepL glossary ID to apply
   -h, --help             Show this help text
@@ -486,16 +521,16 @@ function createDeepLTranslator(options = {}) {
   }
 
   const translator = new DeepLTranslator(authKey);
-  const formality = options.formality ?? 'default';
+  const requestedFormality = options.formality ?? 'default';
+  const normalizedFormality = normalizeDeepLFormality(requestedFormality);
   const glossaryId = options.glossaryId ?? null;
 
   return async (card) => {
     const sentence = (card.sentence || '').trim();
     if (!sentence.length) return null;
     try {
-      const response = await translator.translateText(sentence, 'en-US', {
-        sourceLang: 'ja',
-        formality: formality === 'default' ? undefined : formality,
+      const response = await translator.translateText(sentence, 'ja', 'en-US', {
+        formality: normalizedFormality === 'default' ? undefined : normalizedFormality,
         glossaryId: glossaryId || undefined,
       });
       if (Array.isArray(response)) {
@@ -511,5 +546,21 @@ function createDeepLTranslator(options = {}) {
       return null;
     }
   };
+}
+
+function normalizeDeepLFormality(value) {
+  if (!value) return 'default';
+  switch (value) {
+    case 'more':
+    case 'less':
+    case 'default':
+      return value;
+    case 'prefer_more':
+      return 'more';
+    case 'prefer_less':
+      return 'less';
+    default:
+      return 'default';
+  }
 }
 

@@ -5,13 +5,14 @@
  *  - a TSV file (front/back) that can be imported into Anki
  *
  * Usage:
- *   node scripts/parseSubs.mjs path/to/file.srt [--json out.json] [--tsv out.tsv]
+ *   node scripts/parseSubs.mjs subtitles/<Show>/episodeXX/raw/episodeXX.ja.srt \
+ *     [--json out.json] [--tsv out.tsv]
  *     --no-json    Skip writing the JSON output
  *     --no-tsv     Skip writing the TSV output
  *
  * Both outputs default to "<original>.cards.json/tsv" when not provided.
  */
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { basename, dirname, extname, resolve } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -204,8 +205,19 @@ function parseOptions(tokens) {
 
 function defaultOutPath(input, suffix) {
   const dir = dirname(input);
-  const base = basename(input, extname(input));
-  return resolve(dir, `${base}${suffix}`);
+  const baseName = basename(input, extname(input));
+  const normalizedBase = baseName.replace(/\.(ja|jp)$/i, '');
+
+  let targetDir = dir;
+  if (basename(dir).toLowerCase() === 'raw') {
+    const parentDir = dirname(dir);
+    targetDir = resolve(parentDir, 'cards');
+    if (!existsSync(targetDir)) {
+      mkdirSync(targetDir, { recursive: true });
+    }
+  }
+
+  return resolve(targetDir, `${normalizedBase}${suffix}`);
 }
 
 function printUsage() {
