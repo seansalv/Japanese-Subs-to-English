@@ -6,7 +6,7 @@
  *  - refreshed TSV output compatible with Anki
  *
  * Usage:
- *   node scripts/enrichCards.mjs path/to/cards.json [options]
+ *   npx tsx scripts/enrichCards.ts path/to/cards.json [options]
  *
  * Options:
  *   --dict <file>          Path to a dictionary JSON (defaults to data/japanese-mini-dict.json)
@@ -14,18 +14,87 @@
  *   --out <file>           Custom path for the enriched card JSON (defaults to input path)
  *   --tsv <file>           Custom path for the TSV output (defaults to alongside JSON)
  *   --no-tsv               Skip writing the TSV file
+ *   --auto-translate       Use DeepL API to fill missing translations
+ *   --deepl-translate      Alias for --auto-translate
+ *   --auto-translate-keep  Keep existing card translations (don’t overwrite literals)
+ *   --deepl-formality <v>  DeepL formality (default, more, less, prefer_more, prefer_less)
+ *   --deepl-glossary <id>  DeepL glossary ID to apply
  *   -h, --help             Show usage help
  */
+
 import 'dotenv/config';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import kuromoji from 'kuromoji';
-import deepl from 'deepl-node';
+import type { IpadicFeatures, Tokenizer } from 'kuromoji';
+import { Translator as DeepLTranslator } from 'deepl-node';
 
-const { Translator: DeepLTranslator } = deepl;
+type KuromojiTokenizer = Tokenizer<IpadicFeatures>;
 
-const POS_MAP = {
+interface DictionaryEntry {
+  lemma: string;
+  reading?: string;
+  pos?: string;
+  meanings?: string[];
+}
+
+interface TokenBreakdown {
+  surface: string;
+  lemma: string;
+  reading: string | null;
+  pos: string;
+  meanings: string[] | null;
+}
+
+interface CardRecord {
+  id: number;
+  subtitleId?: number | null;
+  sentence?: string | null;
+  translation?: string | null;
+  romaji?: string;
+  furigana?: string;
+  startTime?: string | null;
+  endTime?: string | null;
+  startMs?: number | null;
+  endMs?: number | null;
+  tokens?: TokenBreakdown[];
+  [key: string]: unknown;
+}
+
+interface TranslationEntry {
+  id: number | string | null;
+  subtitleId: number | string | null;
+  sentence: string | null;
+  translation: string;
+}
+
+interface TranslationState {
+  byId: Map<string, string>;
+  bySubtitleId: Map<string, string>;
+  bySentence: Map<string, string>;
+  addedEntries: TranslationEntry[];
+  initialEntries: TranslationEntry[];
+  sourcePath: string | null;
+}
+
+interface CliOptions {
+  inputPath: string;
+  dictPath: string;
+  translationPath: string | null;
+  translationSavePath: string | null;
+  outputJsonPath: string;
+  tsvPath: string;
+  writeTsv: boolean;
+  autoTranslate: boolean;
+  autoTranslateReplace: boolean;
+  deeplFormality: string;
+  deeplGlossaryId: string | null;
+}
+
+type TranslatorFn = (card: CardRecord) => Promise<string | null>;
+
+const POS_MAP: Record<string, string> = {
   名詞: 'noun',
   動詞: 'verb',
   形容詞: 'adjective',
@@ -39,7 +108,6 @@ const POS_MAP = {
   接頭詞: 'prefix',
   その他: 'other',
   フィラー: 'filler',
-  // details
   一般: 'general',
   固有名詞: 'proper-noun',
   サ変接続: 'suru-verb',
@@ -61,7 +129,6 @@ const POS_MAP = {
   句点: 'period',
   読点: 'comma',
   空白: 'whitespace',
-  一般: 'general',
   記号一般: 'symbol-general',
   代名詞: 'pronoun',
   副詞可能: 'adverbial',
@@ -74,25 +141,28 @@ const POS_MAP = {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const args = process.argv.slice(2);
-if (!args.length || args.includes('-h') || args.includes('--help')) {
-  printUsage();
-  process.exit(args.length ? 0 : 1);
-}
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  if (!args.length || args.includes('-h') || args.includes('--help')) {
+    printUsage();
+    process.exit(args.length ? 0 : 1);
+  }
 
-try {
   const options = parseOptions(args);
 
   const tokenizer = await buildTokenizer();
   const dictionary = loadDictionary(options.dictPath);
   const translations = loadTranslationHints(options.translationPath);
-  const translator = options.autoTranslate ? createDeepLTranslator({
-    formality: options.deeplFormality,
-    glossaryId: options.deeplGlossaryId,
-  }) : null;
+  const translator: TranslatorFn | null = options.autoTranslate
+    ? createDeepLTranslator({
+        formality: options.deeplFormality,
+        glossaryId: options.deeplGlossaryId,
+      })
+    : null;
 
-  const rawCards = JSON.parse(readFileSync(options.inputPath, 'utf8'));
-  const enrichedCards = [];
+  const rawCards: CardRecord[] = JSON.parse(readFileSync(options.inputPath, 'utf8'));
+  const enrichedCards: CardRecord[] = [];
+
   for (const card of rawCards) {
     // eslint-disable-next-line no-await-in-loop
     const enriched = await enrichCard(
@@ -119,15 +189,16 @@ try {
   if (options.translationSavePath && translations.addedEntries.length) {
     persistTranslations(translations, options.translationSavePath);
   }
-} catch (error) {
-  console.error(error.message || error);
-  process.exit(1);
 }
 
-/**
- * @param {ReturnType<kuromoji.Builder["build"]>} tokenizer
- */
-async function enrichCard(card, tokenizer, dictionary, translations, translator, options = {}) {
+async function enrichCard(
+  card: CardRecord,
+  tokenizer: KuromojiTokenizer,
+  dictionary: Map<string, DictionaryEntry>,
+  translations: TranslationState,
+  translator: TranslatorFn | null,
+  options: { autoTranslateReplace: boolean },
+): Promise<CardRecord> {
   const tokens = tokenizer.tokenize(card.sentence || '');
   const breakdown = tokens
     .map((token) => normalizeToken(token, dictionary))
@@ -136,7 +207,7 @@ async function enrichCard(card, tokenizer, dictionary, translations, translator,
   const translatorEnabled = Boolean(translator);
   const cardTranslation = (card.translation || '').trim();
 
-  let translationSource = null;
+  let translationSource: 'hint' | 'card' | 'literal' | 'deepl' | null = null;
   let translation = pickTranslation(card, translations);
   if (translation) {
     translationSource = 'hint';
@@ -156,7 +227,7 @@ async function enrichCard(card, tokenizer, dictionary, translations, translator,
     translatorEnabled &&
     (!translation || (options.autoTranslateReplace && translationSource !== 'hint'));
 
-  if (shouldAutoTranslate) {
+  if (shouldAutoTranslate && translator) {
     const generated = await translator(card);
     if (generated) {
       translation = generated;
@@ -172,7 +243,7 @@ async function enrichCard(card, tokenizer, dictionary, translations, translator,
   };
 }
 
-function normalizeToken(token, dictionary) {
+function normalizeToken(token: IpadicFeatures, dictionary: Map<string, DictionaryEntry>): TokenBreakdown {
   const lemma = token.basic_form && token.basic_form !== '*' ? token.basic_form : token.surface_form;
   const dictEntry = dictionary.get(lemma);
 
@@ -185,14 +256,14 @@ function normalizeToken(token, dictionary) {
   };
 }
 
-function buildPosLabel(token) {
+function buildPosLabel(token: IpadicFeatures): string {
   return [token.pos, token.pos_detail_1, token.pos_detail_2, token.pos_detail_3]
     .map((part) => translatePosPart(part))
-    .filter(Boolean)
+    .filter((part): part is string => Boolean(part))
     .join('-');
 }
 
-function translatePosPart(part) {
+function translatePosPart(part?: string | null): string | null {
   if (!part || part === '*') return null;
   return part
     .split('／')
@@ -203,31 +274,31 @@ function translatePosPart(part) {
     .join('/');
 }
 
-function buildLiteralTranslation(tokens) {
+function buildLiteralTranslation(tokens: TokenBreakdown[]): string {
   if (!tokens.length) return '';
   return tokens
     .map((token) => (token.meanings?.[0] ? token.meanings[0] : token.surface))
     .join(' ');
 }
 
-function pickTranslation(card, translations) {
+function pickTranslation(card: CardRecord, translations: TranslationState): string | null {
   if (translations.byId.has(String(card.id))) {
-    return translations.byId.get(String(card.id));
+    return translations.byId.get(String(card.id)) ?? null;
   }
 
   if (card.subtitleId != null && translations.bySubtitleId.has(String(card.subtitleId))) {
-    return translations.bySubtitleId.get(String(card.subtitleId));
+    return translations.bySubtitleId.get(String(card.subtitleId)) ?? null;
   }
 
   const normalizedSentence = (card.sentence || '').trim();
   if (normalizedSentence.length && translations.bySentence.has(normalizedSentence)) {
-    return translations.bySentence.get(normalizedSentence);
+    return translations.bySentence.get(normalizedSentence) ?? null;
   }
 
   return null;
 }
 
-async function buildTokenizer() {
+function buildTokenizer(): Promise<KuromojiTokenizer> {
   const dictPath = resolve(__dirname, '../node_modules/kuromoji/dict');
   return new Promise((resolvePromise, rejectPromise) => {
     kuromoji.builder({ dicPath: dictPath }).build((err, tokenizer) => {
@@ -240,23 +311,23 @@ async function buildTokenizer() {
   });
 }
 
-function loadDictionary(dictPath) {
+function loadDictionary(dictPath: string): Map<string, DictionaryEntry> {
   if (!existsSync(dictPath)) {
     console.warn(`Dictionary file not found at ${dictPath}. Meanings will be omitted.`);
     return new Map();
   }
 
-  const payload = JSON.parse(readFileSync(dictPath, 'utf8'));
-  const entries = Array.isArray(payload) ? payload : [];
+  const payload = JSON.parse(readFileSync(dictPath, 'utf8')) as DictionaryEntry[] | DictionaryEntry;
+  const entries = Array.isArray(payload) ? payload : [payload];
 
   return new Map(entries.map((entry) => [entry.lemma, entry]));
 }
 
-function loadTranslationHints(path) {
-  const byId = new Map();
-  const bySubtitleId = new Map();
-  const bySentence = new Map();
-  const initialEntries = [];
+function loadTranslationHints(path: string | null): TranslationState {
+  const byId = new Map<string, string>();
+  const bySubtitleId = new Map<string, string>();
+  const bySentence = new Map<string, string>();
+  const initialEntries: TranslationEntry[] = [];
 
   if (!path) {
     return { byId, bySubtitleId, bySentence, addedEntries: [], initialEntries, sourcePath: null };
@@ -267,9 +338,9 @@ function loadTranslationHints(path) {
     return { byId, bySubtitleId, bySentence, addedEntries: [], initialEntries, sourcePath: path };
   }
 
-  const raw = JSON.parse(readFileSync(path, 'utf8'));
+  const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown;
 
-  const registerEntry = (entryLike) => {
+  const registerEntry = (entryLike: unknown): void => {
     const safeEntry = sanitizeTranslationEntry(entryLike);
     if (!safeEntry) return;
     if (safeEntry.id != null) {
@@ -299,20 +370,24 @@ function loadTranslationHints(path) {
   return { byId, bySubtitleId, bySentence, addedEntries: [], initialEntries, sourcePath: path };
 }
 
-function katakanaToHiragana(text) {
+function katakanaToHiragana(text: string): string {
   return text.replace(/[\u30a1-\u30f6]/g, (char) =>
     String.fromCharCode(char.charCodeAt(0) - 0x60),
   );
 }
 
-function parseOptions(cliArgs) {
-  const opts = {
-    inputPath: null,
+function parseOptions(cliArgs: string[]): CliOptions {
+  if (!cliArgs.length) {
+    throw new Error('Input cards JSON is required.');
+  }
+
+  const opts: CliOptions = {
+    inputPath: resolve(cliArgs[0]),
     dictPath: resolveDefaultDict(),
     translationPath: null,
     translationSavePath: null,
-    outputJsonPath: null,
-    tsvPath: null,
+    outputJsonPath: '',
+    tsvPath: '',
     writeTsv: true,
     autoTranslate: false,
     autoTranslateReplace: true,
@@ -320,25 +395,23 @@ function parseOptions(cliArgs) {
     deeplGlossaryId: null,
   };
 
-  opts.inputPath = resolve(cliArgs[0]);
-
   for (let i = 1; i < cliArgs.length; i += 1) {
     const token = cliArgs[i];
     switch (token) {
       case '--dict':
-        opts.dictPath = ensureNext(cliArgs, ++i, '--dict');
+        opts.dictPath = resolve(ensureNext(cliArgs, ++i, '--dict'));
         break;
       case '--translations':
-        opts.translationPath = ensureNext(cliArgs, ++i, '--translations');
+        opts.translationPath = resolve(ensureNext(cliArgs, ++i, '--translations'));
         break;
       case '--translations-out':
-        opts.translationSavePath = ensureNext(cliArgs, ++i, '--translations-out');
+        opts.translationSavePath = resolve(ensureNext(cliArgs, ++i, '--translations-out'));
         break;
       case '--out':
-        opts.outputJsonPath = ensureNext(cliArgs, ++i, '--out');
+        opts.outputJsonPath = resolve(ensureNext(cliArgs, ++i, '--out'));
         break;
       case '--tsv':
-        opts.tsvPath = ensureNext(cliArgs, ++i, '--tsv');
+        opts.tsvPath = resolve(ensureNext(cliArgs, ++i, '--tsv'));
         break;
       case '--no-tsv':
         opts.writeTsv = false;
@@ -361,13 +434,13 @@ function parseOptions(cliArgs) {
     }
   }
 
-  opts.outputJsonPath = resolve(
-    opts.outputJsonPath ?? opts.inputPath,
-  );
+  opts.outputJsonPath = resolve(opts.outputJsonPath || opts.inputPath);
 
   if (opts.writeTsv) {
     const guessedTsv = replaceExt(opts.outputJsonPath, '.tsv');
-    opts.tsvPath = resolve(opts.tsvPath ?? guessedTsv);
+    opts.tsvPath = resolve(opts.tsvPath || guessedTsv);
+  } else {
+    opts.tsvPath = opts.tsvPath ? resolve(opts.tsvPath) : opts.outputJsonPath.replace(/\.json$/, '.tsv');
   }
 
   if (!opts.translationSavePath && opts.translationPath) {
@@ -377,33 +450,35 @@ function parseOptions(cliArgs) {
   return opts;
 }
 
-function ensureNext(tokens, index, optionName) {
+function ensureNext(tokens: string[], index: number, optionName: string): string {
   if (index >= tokens.length) {
     throw new Error(`${optionName} requires a file path argument.`);
   }
-  return resolve(tokens[index]);
+  return tokens[index];
 }
 
-function replaceExt(filePath, newExt) {
+function replaceExt(filePath: string, newExt: string): string {
   const dir = dirname(filePath);
   const base = basename(filePath, extname(filePath));
   return resolve(dir, `${base}${newExt}`);
 }
 
-function resolveDefaultDict() {
+function resolveDefaultDict(): string {
   return resolve(__dirname, '../data/japanese-mini-dict.json');
 }
 
-function cardsToTsv(cards) {
-  return cards.map((card) => `${clean(card.sentence)}\t${clean(card.translation)}`).join('\n');
+function cardsToTsv(cards: CardRecord[]): string {
+  return cards
+    .map((card) => `${clean(card.sentence)}\t${clean(card.translation as string | null | undefined)}`)
+    .join('\n');
 }
 
-function clean(value) {
+function clean(value: string | null | undefined): string {
   return (value ?? '').replace(/\t/g, ' ').replace(/\r?\n/g, ' ').trim();
 }
 
-function printUsage() {
-  console.log(`Usage: node scripts/enrichCards.mjs <cards.json> [options]
+function printUsage(): void {
+  console.log(`Usage: npx tsx scripts/enrichCards.ts <cards.json> [options]
 
 Options:
   --dict <path>          Custom dictionary JSON
@@ -422,25 +497,27 @@ Options:
 `);
 }
 
-function sanitizeTranslationEntry(entry) {
-  if (!entry || typeof entry.translation !== 'string') return null;
-  const translation = entry.translation.trim();
+function sanitizeTranslationEntry(entry: unknown): TranslationEntry | null {
+  if (!entry || typeof entry !== 'object') return null;
+  const maybe = entry as Record<string, unknown>;
+  if (typeof maybe.translation !== 'string') return null;
+  const translation = maybe.translation.trim();
   if (!translation.length) return null;
 
   const sentence =
-    typeof entry.sentence === 'string' && entry.sentence.trim().length
-      ? entry.sentence.trim()
+    typeof maybe.sentence === 'string' && maybe.sentence.trim().length
+      ? maybe.sentence.trim()
       : null;
 
   const normalizedId =
-    entry.id === null || entry.id === undefined || entry.id === ''
+    maybe.id === null || maybe.id === undefined || maybe.id === ''
       ? null
-      : normalizeNumeric(entry.id);
+      : normalizeNumeric(maybe.id);
 
   const normalizedSubtitleId =
-    entry.subtitleId === null || entry.subtitleId === undefined || entry.subtitleId === ''
+    maybe.subtitleId === null || maybe.subtitleId === undefined || maybe.subtitleId === ''
       ? null
-      : normalizeNumeric(entry.subtitleId);
+      : normalizeNumeric(maybe.subtitleId);
 
   return {
     id: normalizedId,
@@ -450,13 +527,17 @@ function sanitizeTranslationEntry(entry) {
   };
 }
 
-function normalizeNumeric(value) {
+function normalizeNumeric(value: unknown): number | string {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
-  const num = Number.parseInt(value, 10);
-  return Number.isNaN(num) ? value : num;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isNaN(parsed) ? String(value) : parsed;
 }
 
-function registerGeneratedTranslation(translations, card, translation) {
+function registerGeneratedTranslation(
+  translations: TranslationState,
+  card: CardRecord,
+  translation: string,
+): void {
   const normalizedSentence = (card.sentence || '').trim() || null;
 
   if (card.id != null) {
@@ -469,17 +550,18 @@ function registerGeneratedTranslation(translations, card, translation) {
     translations.bySentence.set(normalizedSentence, translation);
   }
 
-  translations.addedEntries.push(
-    sanitizeTranslationEntry({
-      id: card.id ?? null,
-      subtitleId: card.subtitleId ?? null,
-      sentence: normalizedSentence,
-      translation,
-    }),
-  );
+  const entry = sanitizeTranslationEntry({
+    id: card.id ?? null,
+    subtitleId: card.subtitleId ?? null,
+    sentence: normalizedSentence,
+    translation,
+  });
+  if (entry) {
+    translations.addedEntries.push(entry);
+  }
 }
 
-function persistTranslations(translations, outputPath) {
+function persistTranslations(translations: TranslationState, outputPath: string): void {
   const existing = translations.initialEntries ?? [];
   const additions = translations.addedEntries ?? [];
   const merged = mergeTranslationEntries(existing, additions);
@@ -489,23 +571,24 @@ function persistTranslations(translations, outputPath) {
   );
 }
 
-function mergeTranslationEntries(existing, additions) {
-  const map = new Map();
+function mergeTranslationEntries(
+  existing: TranslationEntry[],
+  additions: TranslationEntry[],
+): TranslationEntry[] {
+  const map = new Map<string, TranslationEntry>();
   let anonCounter = 0;
 
-  const put = (entry) => {
+  const put = (entry: TranslationEntry | null): void => {
     if (!entry) return;
-    const safe = sanitizeTranslationEntry(entry);
-    if (!safe) return;
     const key =
-      safe.subtitleId != null
-        ? `subtitleId:${safe.subtitleId}`
-        : safe.id != null
-          ? `id:${safe.id}`
-          : safe.sentence
-            ? `sentence:${safe.sentence}`
+      entry.subtitleId != null
+        ? `subtitleId:${entry.subtitleId}`
+        : entry.id != null
+          ? `id:${entry.id}`
+          : entry.sentence
+            ? `sentence:${entry.sentence}`
             : `anon:${anonCounter++}`;
-    map.set(key, safe);
+    map.set(key, entry);
   };
 
   existing.forEach(put);
@@ -514,7 +597,10 @@ function mergeTranslationEntries(existing, additions) {
   return Array.from(map.values());
 }
 
-function createDeepLTranslator(options = {}) {
+function createDeepLTranslator(options: {
+  formality?: string;
+  glossaryId?: string | null;
+}): TranslatorFn {
   const authKey = process.env.DEEPL_API_KEY;
   if (!authKey) {
     throw new Error('DEEPL_API_KEY environment variable is required for --deepl-translate.');
@@ -525,31 +611,29 @@ function createDeepLTranslator(options = {}) {
   const normalizedFormality = normalizeDeepLFormality(requestedFormality);
   const glossaryId = options.glossaryId ?? null;
 
-  return async (card) => {
+  return async (card: CardRecord) => {
     const sentence = (card.sentence || '').trim();
     if (!sentence.length) return null;
     try {
       const response = await translator.translateText(sentence, 'ja', 'en-US', {
         formality: normalizedFormality === 'default' ? undefined : normalizedFormality,
-        glossaryId: glossaryId || undefined,
+        glossary: glossaryId ?? undefined,
       });
       if (Array.isArray(response)) {
         return response[0]?.text?.trim() ?? null;
       }
       return response?.text?.trim() ?? null;
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       console.warn(
-        `DeepL translation failed for subtitle ${card.subtitleId ?? card.id}: ${
-          error.message || error
-        }`,
+        `DeepL translation failed for subtitle ${card.subtitleId ?? card.id}: ${message}`,
       );
       return null;
     }
   };
 }
 
-function normalizeDeepLFormality(value) {
-  if (!value) return 'default';
+function normalizeDeepLFormality(value: string): 'default' | 'more' | 'less' {
   switch (value) {
     case 'more':
     case 'less':
@@ -563,4 +647,9 @@ function normalizeDeepLFormality(value) {
       return 'default';
   }
 }
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.stack ?? error.message : error);
+  process.exit(1);
+});
 

@@ -5,66 +5,93 @@
  *  - a TSV file (front/back) that can be imported into Anki
  *
  * Usage:
- *   node scripts/parseSubs.mjs subtitles/<Show>/episodeXX/raw/episodeXX.ja.srt \
+ *   npx tsx scripts/parseSubs.ts subtitles/<Show>/episodeXX/raw/episodeXX.ja.srt \
  *     [--json out.json] [--tsv out.tsv]
  *     --no-json    Skip writing the JSON output
  *     --no-tsv     Skip writing the TSV output
  *
  * Both outputs default to "<original>.cards.json/tsv" when not provided.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, resolve } from 'node:path';
 
-const args = process.argv.slice(2);
-
-if (!args.length || args.includes('-h') || args.includes('--help')) {
-  printUsage();
-  process.exit(args.length ? 0 : 1);
+interface SubtitleEntry {
+  index: number;
+  rawId: number;
+  start: string | null;
+  end: string | null;
+  startMs: number | null;
+  endMs: number | null;
+  text: string;
 }
 
-const inputPath = resolve(args[0]);
-let options;
-try {
-  options = parseOptions(args.slice(1));
-} catch (error) {
-  console.error(error.message || error);
-  process.exit(1);
+interface Card {
+  id: number;
+  subtitleId: number;
+  sentence: string;
+  translation: string;
+  romaji: string;
+  furigana: string;
+  startTime: string | null;
+  endTime: string | null;
+  startMs: number | null;
+  endMs: number | null;
 }
 
-const rawContent = readFileSync(inputPath, 'utf8');
-const subtitles = parseSrt(rawContent);
-
-if (!subtitles.length) {
-  console.error(`No subtitle lines found in ${inputPath}.`);
-  process.exit(1);
+interface CliOptions {
+  jsonPath: string | null;
+  tsvPath: string | null;
+  writeJson: boolean;
+  writeTsv: boolean;
 }
 
-const cards = buildCards(subtitles);
-console.log(`Parsed ${subtitles.length} subtitle blocks into ${cards.length} card entries.`);
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
 
-if (options.writeJson) {
-  const jsonPath =
-    options.jsonPath ?? defaultOutPath(inputPath, '.cards.json');
-  writeFileSync(jsonPath, JSON.stringify(cards, null, 2), 'utf8');
-  console.log(`JSON output written to ${jsonPath}`);
+  if (!args.length || args.includes('-h') || args.includes('--help')) {
+    printUsage();
+    process.exit(args.length ? 0 : 1);
+  }
+
+  const inputPath = resolve(args[0]);
+  let options: CliOptions;
+  try {
+    options = parseOptions(args.slice(1));
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error);
+    process.exit(1);
+    return;
+  }
+
+  const rawContent = readFileSync(inputPath, 'utf8');
+  const subtitles = parseSrt(rawContent);
+
+  if (!subtitles.length) {
+    console.error(`No subtitle lines found in ${inputPath}.`);
+    process.exit(1);
+  }
+
+  const cards = buildCards(subtitles);
+  console.log(`Parsed ${subtitles.length} subtitle blocks into ${cards.length} card entries.`);
+
+  if (options.writeJson) {
+    const jsonPath = options.jsonPath ?? defaultOutPath(inputPath, '.cards.json');
+    writeFileSync(jsonPath, JSON.stringify(cards, null, 2), 'utf8');
+    console.log(`JSON output written to ${jsonPath}`);
+  }
+
+  if (options.writeTsv) {
+    const tsvPath = options.tsvPath ?? defaultOutPath(inputPath, '.cards.tsv');
+    writeFileSync(tsvPath, cardsToTsv(cards), 'utf8');
+    console.log(`TSV output written to ${tsvPath}`);
+  }
 }
 
-if (options.writeTsv) {
-  const tsvPath =
-    options.tsvPath ?? defaultOutPath(inputPath, '.cards.tsv');
-  writeFileSync(tsvPath, cardsToTsv(cards), 'utf8');
-  console.log(`TSV output written to ${tsvPath}`);
-}
-
-/**
- * Convert an SRT file into structured subtitle entries.
- * @param {string} content
- * @returns {Array<{index:number,rawId:number,start:string|null,end:string|null,startMs:number|null,endMs:number|null,text:string}>}
- */
-function parseSrt(content) {
+function parseSrt(content: string): SubtitleEntry[] {
   const normalized = content.replace(/\r\n/g, '\n').replace(/\uFEFF/g, '');
   const blocks = normalized.split(/\n{2,}/);
-  const entries = [];
+  const entries: SubtitleEntry[] = [];
 
   for (const block of blocks) {
     const lines = block.split('\n');
@@ -73,7 +100,7 @@ function parseSrt(content) {
 
     let cursor = meaningfulStart;
     const maybeId = Number.parseInt(lines[cursor].trim(), 10);
-    let rawId;
+    let rawId: number;
 
     if (Number.isFinite(maybeId)) {
       rawId = maybeId;
@@ -82,8 +109,8 @@ function parseSrt(content) {
       rawId = entries.length + 1;
     }
 
-    let start = null;
-    let end = null;
+    let start: string | null = null;
+    let end: string | null = null;
 
     if (cursor < lines.length && lines[cursor].includes('-->')) {
       const [startRaw, endRaw] = lines[cursor]
@@ -116,11 +143,7 @@ function parseSrt(content) {
   return entries;
 }
 
-/**
- * Convert subtitle entries into card data.
- * @param {ReturnType<typeof parseSrt>} subtitles
- */
-function buildCards(subtitles) {
+function buildCards(subtitles: SubtitleEntry[]): Card[] {
   return subtitles.map((entry, idx) => ({
     id: idx + 1,
     subtitleId: entry.rawId,
@@ -135,21 +158,15 @@ function buildCards(subtitles) {
   }));
 }
 
-/**
- * Transform cards into a TSV string ready for Anki import.
- * @param {Array<ReturnType<typeof buildCards>[number]>} cards
- */
-function cardsToTsv(cards) {
-  return cards
-    .map((card) => `${clean(card.sentence)}\t${clean(card.translation)}`)
-    .join('\n');
+function cardsToTsv(cards: Card[]): string {
+  return cards.map((card) => `${clean(card.sentence)}\t${clean(card.translation)}`).join('\n');
 }
 
-function clean(value) {
+function clean(value: string | null | undefined): string {
   return (value ?? '').replace(/\t/g, ' ').replace(/\r?\n/g, ' ').trim();
 }
 
-function timecodeToMs(timecode) {
+function timecodeToMs(timecode: string | null): number | null {
   if (!timecode) return null;
   const match = timecode.match(/(\d{2}):(\d{2}):(\d{2}),(\d{3})/);
   if (!match) return null;
@@ -162,8 +179,8 @@ function timecodeToMs(timecode) {
   );
 }
 
-function parseOptions(tokens) {
-  const opts = {
+function parseOptions(tokens: string[]): CliOptions {
+  const opts: CliOptions = {
     jsonPath: null,
     tsvPath: null,
     writeJson: true,
@@ -174,16 +191,10 @@ function parseOptions(tokens) {
     const token = tokens[i];
     switch (token) {
       case '--json':
-        if (i + 1 >= tokens.length) {
-          throw new Error('--json needs a file path argument.');
-        }
-        opts.jsonPath = resolve(tokens[++i]);
+        opts.jsonPath = resolve(requirePathArgument(tokens, ++i, '--json'));
         break;
       case '--tsv':
-        if (i + 1 >= tokens.length) {
-          throw new Error('--tsv needs a file path argument.');
-        }
-        opts.tsvPath = resolve(tokens[++i]);
+        opts.tsvPath = resolve(requirePathArgument(tokens, ++i, '--tsv'));
         break;
       case '--no-json':
         opts.writeJson = false;
@@ -203,7 +214,14 @@ function parseOptions(tokens) {
   return opts;
 }
 
-function defaultOutPath(input, suffix) {
+function requirePathArgument(tokens: string[], index: number, flag: string): string {
+  if (index >= tokens.length) {
+    throw new Error(`${flag} needs a file path argument.`);
+  }
+  return tokens[index];
+}
+
+function defaultOutPath(input: string, suffix: string): string {
   const dir = dirname(input);
   const baseName = basename(input, extname(input));
   const normalizedBase = baseName.replace(/\.(ja|jp)$/i, '');
@@ -220,8 +238,8 @@ function defaultOutPath(input, suffix) {
   return resolve(targetDir, `${normalizedBase}${suffix}`);
 }
 
-function printUsage() {
-  console.log(`Usage: node scripts/parseSubs.mjs <file.srt> [options]
+function printUsage(): void {
+  console.log(`Usage: npx tsx scripts/parseSubs.ts <file.srt> [options]
 
 Options:
   --json <path>    Custom path for the card JSON output
@@ -233,3 +251,9 @@ Options:
 Outputs default to "<input>.cards.json" and "<input>.cards.tsv".
 `);
 }
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.stack ?? error.message : error);
+  process.exit(1);
+});
+
