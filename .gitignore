@@ -1,0 +1,20 @@
+# Node & tooling artifacts
+node_modules/
+npm-debug.log*
+yarn-error.log
+
+# Environment & OS junk
+.env
+.env.*
+.DS_Store
+Thumbs.db
+
+# Build / cache output
+dist/
+tmp/
+.cache/
+
+# Generated learning assets
+subtitles/**/*.cards.json
+subtitles/**/*.cards.tsv
+

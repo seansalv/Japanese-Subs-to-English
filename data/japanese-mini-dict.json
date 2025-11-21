@@ -1,0 +1,189 @@
+[
+  {
+    "lemma": "仕事",
+    "reading": "しごと",
+    "pos": "noun",
+    "meanings": ["work", "job", "business"]
+  },
+  {
+    "lemma": "行く",
+    "reading": "いく",
+    "pos": "verb",
+    "meanings": ["to go", "to proceed"]
+  },
+  {
+    "lemma": "か",
+    "reading": "か",
+    "pos": "particle",
+    "meanings": ["question marker", "soft imperative"]
+  },
+  {
+    "lemma": "木",
+    "reading": "き",
+    "pos": "noun",
+    "meanings": ["tree", "wood"]
+  },
+  {
+    "lemma": "切る",
+    "reading": "きる",
+    "pos": "verb",
+    "meanings": ["to cut"]
+  },
+  {
+    "lemma": "月収",
+    "reading": "げっしゅう",
+    "pos": "noun",
+    "meanings": ["monthly income"]
+  },
+  {
+    "lemma": "売る",
+    "reading": "うる",
+    "pos": "verb",
+    "meanings": ["to sell"]
+  },
+  {
+    "lemma": "腎臓",
+    "reading": "じんぞう",
+    "pos": "noun",
+    "meanings": ["kidney"]
+  },
+  {
+    "lemma": "右目",
+    "reading": "みぎめ",
+    "pos": "noun",
+    "meanings": ["right eye"]
+  },
+  {
+    "lemma": "借金",
+    "reading": "しゃっきん",
+    "pos": "noun",
+    "meanings": ["debt", "loan"]
+  },
+  {
+    "lemma": "悪魔",
+    "reading": "あくま",
+    "pos": "noun",
+    "meanings": ["devil", "demon"]
+  },
+  {
+    "lemma": "殺す",
+    "reading": "ころす",
+    "pos": "verb",
+    "meanings": ["to kill"]
+  },
+  {
+    "lemma": "体",
+    "reading": "からだ",
+    "pos": "noun",
+    "meanings": ["body"]
+  },
+  {
+    "lemma": "大体",
+    "reading": "だいたい",
+    "pos": "adverb",
+    "meanings": ["roughly", "approximately"]
+  },
+  {
+    "lemma": "音",
+    "reading": "おと",
+    "pos": "noun",
+    "meanings": ["sound"]
+  },
+  {
+    "lemma": "種",
+    "reading": "たね",
+    "pos": "noun",
+    "meanings": ["seed"]
+  },
+  {
+    "lemma": "復活",
+    "reading": "ふっかつ",
+    "pos": "noun",
+    "meanings": ["revival", "resurrection"]
+  },
+  {
+    "lemma": "焼く",
+    "reading": "やく",
+    "pos": "verb",
+    "meanings": ["to burn", "to grill"]
+  },
+  {
+    "lemma": "闇市",
+    "reading": "やみいち",
+    "pos": "noun",
+    "meanings": ["black market"]
+  },
+  {
+    "lemma": "死体",
+    "reading": "したい",
+    "pos": "noun",
+    "meanings": ["corpse"]
+  },
+  {
+    "lemma": "報酬",
+    "reading": "ほうしゅう",
+    "pos": "noun",
+    "meanings": ["reward", "compensation"]
+  },
+  {
+    "lemma": "引く",
+    "reading": "ひく",
+    "pos": "verb",
+    "meanings": ["to pull", "to subtract"]
+  },
+  {
+    "lemma": "利子",
+    "reading": "りし",
+    "pos": "noun",
+    "meanings": ["interest (on loan)"]
+  },
+  {
+    "lemma": "残り",
+    "reading": "のこり",
+    "pos": "noun",
+    "meanings": ["remainder", "rest"]
+  },
+  {
+    "lemma": "家",
+    "reading": "いえ",
+    "pos": "noun",
+    "meanings": ["house", "home"]
+  },
+  {
+    "lemma": "食べ物",
+    "reading": "たべもの",
+    "pos": "noun",
+    "meanings": ["food"]
+  },
+  {
+    "lemma": "暮らす",
+    "reading": "くらす",
+    "pos": "verb",
+    "meanings": ["to live", "to get by"]
+  },
+  {
+    "lemma": "今日",
+    "reading": "きょう",
+    "pos": "noun",
+    "meanings": ["today"]
+  },
+  {
+    "lemma": "食パン",
+    "reading": "しょくぱん",
+    "pos": "noun",
+    "meanings": ["sliced bread"]
+  },
+  {
+    "lemma": "何で",
+    "reading": "なんで",
+    "pos": "adverb",
+    "meanings": ["why", "how come"]
+  },
+  {
+    "lemma": "雇う",
+    "reading": "やとう",
+    "pos": "verb",
+    "meanings": ["to employ", "to hire"]
+  }
+]
+
